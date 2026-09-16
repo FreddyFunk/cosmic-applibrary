@@ -27,7 +27,10 @@ use cosmic::{
     cosmic_config::{Config, CosmicConfigEntry},
     cosmic_theme::Spacing,
     dbus_activation,
-    desktop::{DesktopEntryData, IconSourceExt, fde::PathSource, load_desktop_file},
+    desktop::{
+        DesktopEntryData, GpuDescriptor, GpuLaunch, IconSourceExt, fde::PathSource,
+        load_desktop_file, select_gpu,
+    },
     iced::{
         self, Alignment, Color, Length, Limits, Size, Subscription,
         event::{listen_with, wayland::OverlapNotifyEvent},
@@ -91,7 +94,6 @@ use itertools::Itertools;
 use log::error;
 use sctk::shell::wlr_layer;
 use serde::{Deserialize, Serialize};
-use switcheroo_control::Gpu;
 
 use crate::app_group::{AppGroup, AppLibraryConfig};
 use crate::fl;
@@ -255,7 +257,7 @@ struct CosmicAppLibrary {
     scroll_offset: f32,
     core: Core,
     group_to_delete: Option<usize>,
-    gpus: Option<Vec<Gpu>>,
+    gpus: Option<Vec<GpuDescriptor>>,
     last_hide: Option<Instant>,
     duplicates: HashMap<PathBuf, (AppSource, Option<widget::icon::Handle>)>,
     app_list_config: AppListConfig,
@@ -314,7 +316,7 @@ impl Default for CosmicAppLibrary {
     }
 }
 
-async fn try_get_gpus() -> Option<Vec<Gpu>> {
+async fn try_get_gpus() -> Option<Vec<GpuDescriptor>> {
     let connection = zbus::Connection::system().await.ok()?;
     let proxy = switcheroo_control::SwitcherooControlProxy::new(&connection)
         .await
@@ -328,30 +330,26 @@ async fn try_get_gpus() -> Option<Vec<Gpu>> {
     if gpus.is_empty() {
         return None;
     }
-    Some(gpus)
+    Some(
+        gpus.into_iter()
+            .map(|gpu| GpuDescriptor {
+                name: gpu.name,
+                environment: gpu.environment,
+                default: gpu.default,
+                discrete: gpu.discrete,
+            })
+            .collect(),
+    )
 }
 
-fn preferred_gpu_idx(gpus: &[Gpu], prefers_discrete: bool) -> Option<usize> {
-    if prefers_discrete {
-        gpus.iter()
-            .position(|gpu| gpu.default && gpu.discrete)
-            .or_else(|| gpus.iter().position(|gpu| gpu.discrete))
-            .or_else(|| gpus.iter().position(|gpu| !gpu.default))
-    } else {
-        gpus.iter().position(|gpu| gpu.default)
+fn gpu_environment_override_idx(
+    gpus: &[GpuDescriptor],
+    prefers_non_default_gpu: bool,
+) -> Option<usize> {
+    match select_gpu(gpus, prefers_non_default_gpu).launch {
+        GpuLaunch::SystemDefault => None,
+        GpuLaunch::EnvironmentOverride { gpu_idx } => Some(gpu_idx),
     }
-}
-
-fn automatic_gpu_idx(gpus: &[Gpu], prefers_discrete: bool) -> Option<usize> {
-    if !prefers_discrete || gpus.iter().any(|gpu| gpu.default && gpu.discrete) {
-        None
-    } else {
-        preferred_gpu_idx(gpus, true)
-    }
-}
-
-fn automatic_gpu_idx_from_available(gpus: Option<&[Gpu]>, prefers_discrete: bool) -> Option<usize> {
-    gpus.and_then(|gpus| automatic_gpu_idx(gpus, prefers_discrete))
 }
 
 impl CosmicAppLibrary {
@@ -542,7 +540,7 @@ enum Message {
     FinishDndOffer(Option<usize>, Option<DesktopEntryData>),
     LeaveDndOffer(Option<usize>),
     ScrollYOffset(f32),
-    GpuUpdate(Option<Vec<Gpu>>),
+    GpuUpdate(Option<Vec<GpuDescriptor>>),
     PinToAppTray(usize),
     UnPinFromAppTray(usize),
     AppListConfig(AppListConfig),
@@ -907,7 +905,9 @@ impl cosmic::Application for CosmicAppLibrary {
                         .unwrap_or_default()
                 };
                 let gpu_idx = self.entry_path_input.get(i).and_then(|entry| {
-                    automatic_gpu_idx_from_available(self.gpus.as_deref(), entry.prefers_dgpu)
+                    self.gpus
+                        .as_deref()
+                        .and_then(|gpus| gpu_environment_override_idx(gpus, entry.prefers_dgpu))
                 });
                 return self.activate_app(i, gpu_idx);
             }
@@ -1115,10 +1115,9 @@ impl cosmic::Application for CosmicAppLibrary {
                             tasks.push(self.filter_apps());
                         }
                         MenuAction::DesktopAction(exec) => {
-                            let gpu_idx = automatic_gpu_idx_from_available(
-                                self.gpus.as_deref(),
-                                info.prefers_dgpu,
-                            );
+                            let gpu_idx = self.gpus.as_deref().and_then(|gpus| {
+                                gpu_environment_override_idx(gpus, info.prefers_dgpu)
+                            });
                             let mut exec = shlex::Shlex::new(&exec);
 
                             let mut cmd = match exec.next() {
@@ -1355,7 +1354,9 @@ impl cosmic::Application for CosmicAppLibrary {
 
             if let Some(gpus) = self.gpus.as_ref() {
                 for (j, gpu) in gpus.iter().enumerate() {
-                    let default_idx = preferred_gpu_idx(gpus, menu.prefers_dgpu).unwrap_or(0);
+                    let default_idx = select_gpu(gpus, menu.prefers_dgpu)
+                        .preferred_gpu_idx
+                        .unwrap_or(0);
                     list_column.push(
                         menu_button(text::body(format!(
                             "{} {}",
@@ -1584,8 +1585,10 @@ impl cosmic::Application for CosmicAppLibrary {
             .zip(self.entry_icon_handles.iter())
             .enumerate()
             .map(|(i, ((entry, id), icon_handle))| {
-                let gpu_idx =
-                    automatic_gpu_idx_from_available(self.gpus.as_deref(), entry.prefers_dgpu);
+                let gpu_idx = self
+                    .gpus
+                    .as_deref()
+                    .and_then(|gpus| gpu_environment_override_idx(gpus, entry.prefers_dgpu));
                 let dup = entry
                     .path
                     .as_ref()
